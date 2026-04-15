@@ -3,6 +3,7 @@
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
 import { execSync } from 'child_process';
+import fs from 'fs';
 import os from 'os';
 
 import { logger } from './logger.js';
@@ -10,13 +11,35 @@ import { logger } from './logger.js';
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
 
+/** Whether the runtime is actually Podman behind the docker wrapper. */
+const IS_PODMAN = (() => {
+  try {
+    return execSync('docker --version 2>/dev/null', { encoding: 'utf-8' }).includes('podman');
+  } catch {
+    return false;
+  }
+})();
+
+/** Whether SELinux is enforcing (requires :Z label on bind mounts). */
+const SELINUX_ENFORCING = (() => {
+  try {
+    return fs.readFileSync('/sys/fs/selinux/enforce', 'utf-8').trim() === '1';
+  } catch {
+    return false;
+  }
+})();
+
+/** Volume mount suffix for SELinux relabeling. */
+const MOUNT_SUFFIX = SELINUX_ENFORCING ? ':Z' : '';
+
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
+  const args: string[] = [];
   // On Linux, host.docker.internal isn't built-in — add it explicitly
   if (os.platform() === 'linux') {
-    return ['--add-host=host.docker.internal:host-gateway'];
+    args.push('--add-host=host.docker.internal:host-gateway');
   }
-  return [];
+  return args;
 }
 
 /** Returns CLI args for a readonly bind mount. */
@@ -24,7 +47,41 @@ export function readonlyMountArgs(
   hostPath: string,
   containerPath: string,
 ): string[] {
-  return ['-v', `${hostPath}:${containerPath}:ro`];
+  // Cannot relabel device files like /dev/null
+  const useZ = SELINUX_ENFORCING && !hostPath.startsWith('/dev/');
+  const opts = useZ ? 'ro,Z' : 'ro';
+  return ['-v', `${hostPath}:${containerPath}:${opts}`];
+}
+
+/** Returns the volume suffix string for writable bind mounts. */
+export function writableMountSuffix(): string {
+  return MOUNT_SUFFIX;
+}
+
+/**
+ * Post-process container args to add SELinux :Z labels to volume mounts
+ * injected by external SDKs (e.g. OneCLI) that don't know about SELinux.
+ * Skips /dev/* paths which cannot be relabeled.
+ */
+export function fixupSELinuxMounts(args: string[]): void {
+  if (!SELINUX_ENFORCING) return;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '-v' && i + 1 < args.length) {
+      const mount = args[i + 1];
+      const hostPath = mount.split(':')[0];
+      if (hostPath.startsWith('/dev/')) continue;
+      if (!mount.includes(':Z') && !mount.includes(',Z')) {
+        // Add Z to existing options or append :Z
+        const parts = mount.split(':');
+        if (parts.length === 3) {
+          parts[2] = parts[2] + ',Z';
+        } else if (parts.length === 2) {
+          parts.push('Z');
+        }
+        args[i + 1] = parts.join(':');
+      }
+    }
+  }
 }
 
 /** Stop a container by name. Uses execFileSync to avoid shell injection. */

@@ -21,8 +21,10 @@ import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
   CONTAINER_RUNTIME_BIN,
+  fixupSELinuxMounts,
   hostGatewayArgs,
   readonlyMountArgs,
+  writableMountSuffix,
   stopContainer,
 } from './container-runtime.js';
 import { OneCLI } from '@onecli-sh/sdk';
@@ -285,9 +287,12 @@ async function buildContainerArgs(
     if (mount.readonly) {
       args.push(...readonlyMountArgs(mount.hostPath, mount.containerPath));
     } else {
-      args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+      args.push('-v', `${mount.hostPath}:${mount.containerPath}${writableMountSuffix()}`);
     }
   }
+
+  // Fix up any volume mounts missing SELinux :Z labels (e.g. from OneCLI SDK)
+  fixupSELinuxMounts(args);
 
   args.push(CONTAINER_IMAGE);
 
